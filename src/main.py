@@ -6,6 +6,7 @@ import argparse
 import inspect
 import json
 import shutil
+import subprocess
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -205,6 +206,126 @@ def _make_agent_options(**kwargs) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(**{k: v for k, v in kwargs.items() if k in supported})
 
 
+# ---------------------------------------------------------------------------
+# Claude Code CLI resolution: prefer a system-wide installation, install one
+# on demand, fall back to the SDK-bundled CLI only as a last resort.
+# ---------------------------------------------------------------------------
+
+CLAUDE_CLI_INSTALL_URL = "https://claude.ai/install.sh"
+CLAUDE_CLI_CANDIDATE_PATHS = (
+    "~/.local/bin/claude",
+    "/usr/local/bin/claude",
+    "/usr/bin/claude",
+    "/opt/homebrew/bin/claude",
+    "/home/linuxbrew/.linuxbrew/bin/claude",
+)
+
+_claude_cli_path: str | None = None
+_claude_cli_resolved: bool = False
+
+
+def _find_system_claude_cli() -> str | None:
+    exe = shutil.which("claude")
+    if exe:
+        return exe
+    for raw in CLAUDE_CLI_CANDIDATE_PATHS:
+        p = Path(raw).expanduser()
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def _validate_claude_cli(path: str) -> bool:
+    try:
+        proc = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode == 0:
+        version = (proc.stdout or proc.stderr).strip().splitlines()
+        print(f"[claude-code] system CLI OK: {path} ({version[0] if version else 'version n/a'})", flush=True)
+        return True
+    return False
+
+
+def _install_claude_cli() -> str | None:
+    print(f"[claude-code] system CLI not found, installing via {CLAUDE_CLI_INSTALL_URL} ...", flush=True)
+    script: str | None = None
+    for fetcher in (
+        ["curl", "-fsSL", CLAUDE_CLI_INSTALL_URL],
+        ["wget", "-qO-", CLAUDE_CLI_INSTALL_URL],
+    ):
+        try:
+            proc = subprocess.run(fetcher, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            script = proc.stdout
+            break
+    if script:
+        try:
+            subprocess.run(["bash"], input=script, capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            print(f"[claude-code] install.sh failed: {ex}", file=sys.stderr, flush=True)
+    else:
+        print("[claude-code] could not download install.sh (no curl/wget?), trying npm fallback ...", file=sys.stderr, flush=True)
+
+    if not _find_system_claude_cli():
+        npm = shutil.which("npm")
+        if npm:
+            print("[claude-code] trying npm fallback: npm install -g @anthropic-ai/claude-code ...", flush=True)
+            try:
+                subprocess.run(
+                    [npm, "install", "-g", "@anthropic-ai/claude-code"],
+                    capture_output=True, text=True, timeout=300,
+                )
+            except (OSError, subprocess.TimeoutExpired) as ex:
+                print(f"[claude-code] npm install failed: {ex}", file=sys.stderr, flush=True)
+
+    return _find_system_claude_cli()
+
+
+def resolve_claude_cli() -> str | None:
+    """Return the Claude Code CLI path to use, or None for the SDK-bundled CLI.
+
+    Resolution order:
+    1. explicit override via VASP_AGENT_CLI_PATH / CLAUDE_CODE_PATH;
+    2. a working system-wide `claude` on PATH or at a well-known location;
+    3. on-demand installation (install.sh, then npm) if nothing is found;
+    4. None -> claude-agent-sdk uses its bundled CLI.
+    """
+    global _claude_cli_path, _claude_cli_resolved
+    if _claude_cli_resolved:
+        return _claude_cli_path
+    _claude_cli_resolved = True
+
+    override = os.environ.get("VASP_AGENT_CLI_PATH") or os.environ.get("CLAUDE_CODE_PATH")
+    if override:
+        if Path(override).expanduser().is_file() and _validate_claude_cli(str(Path(override).expanduser())):
+            _claude_cli_path = str(Path(override).expanduser())
+            return _claude_cli_path
+        print(f"[claude-code] warning: CLI override {override!r} is missing or broken, ignoring.", file=sys.stderr, flush=True)
+
+    found = _find_system_claude_cli()
+    if found and _validate_claude_cli(found):
+        _claude_cli_path = found
+        return _claude_cli_path
+
+    installed = _install_claude_cli()
+    if installed and _validate_claude_cli(installed):
+        _claude_cli_path = installed
+        return _claude_cli_path
+
+    print(
+        "[claude-code] no system CLI available after install attempt; "
+        "falling back to the CLI bundled with claude-agent-sdk.",
+        file=sys.stderr, flush=True,
+    )
+    _claude_cli_path = None
+    return _claude_cli_path
+
+
 def build_options(
     workspace: str,
     resume: str | None = None,
@@ -254,6 +375,10 @@ The following was saved by VASP Agent to `{PERSIST_FILENAME}` under this workspa
     # The model name is determined by resolve_llm_endpoint and written to the environment; upstream variables are not parsed again here.
     model_name = os.environ.get("CLAUDE_CODE_MODEL") or None
 
+    # Prefer a system-wide Claude Code CLI (installed on demand if missing);
+    # resolve_claude_cli() returns None to let the SDK use its bundled CLI.
+    cli_path = resolve_claude_cli()
+
     return _make_agent_options(
         cwd=workspace,
         resume=resume,
@@ -261,6 +386,7 @@ The following was saved by VASP Agent to `{PERSIST_FILENAME}` under this workspa
         permission_mode="bypassPermissions",
         stderr=_cli_stderr,
         model=model_name,
+        cli_path=cli_path,
         enable_file_checkpointing=True,
         system_prompt=f"""Your workspace directory is: {workspace}
 All VASP input/output files should be read from and written to this directory.
@@ -642,17 +768,62 @@ async def cli_agent_loop(
             await drain
 
 
+async def _run_prompt_once(
+    client: ClaudeSDKClient,
+    log_file,
+    workspace: str,
+    scheduler: AgentScheduler,
+    prompt: str,
+) -> None:
+    """One-shot mode (--prompt): submit a single instruction, print the reply, then exit.
+
+    Mirrors the CLI receive loop but terminates at the first ResultMessage, so it can be
+    used non-interactively (SSH scripts, cron, headless servers without a TTY for input()).
+    """
+    persist_state: dict[str, Any] = {"persist_assistant_buf": ""}
+
+    async def _drain() -> None:
+        async for msg in client.receive_messages():
+            _append_sdk_log_line(log_file, msg)
+            scheduler.observe_message(msg)
+            persist_on_sdk_message(workspace, msg, persist_state)
+            _dispatch_message_to_cli(msg)
+            if isinstance(msg, ResultMessage):
+                failed = result_message_indicates_failure(msg)
+                scheduler.complete_result(msg, failed=failed)
+                return
+
+    drain_task = asyncio.create_task(_drain())
+    try:
+        control = await scheduler.handle_control_command(prompt, allow_interrupt=True)
+        if control.handled:
+            if control.text:
+                print(f"[scheduler] {control.text}\n", flush=True)
+            return
+        print("Thinking...\n", flush=True)
+        write_user_turn_log(log_file, prompt)
+        await scheduler.submit(prompt)
+        await drain_task
+    finally:
+        if not drain_task.done():
+            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+
+
 async def cli_main(
     workspace: str,
     resume: str | None,
     log_append: bool,
     persist_context: str | None = None,
+    first_prompt: str | None = None,
 ) -> None:
     ws = Path(workspace)
     ws.mkdir(parents=True, exist_ok=True)
     log_path = ws / LOG_FILENAME
 
-    print(f"VASP Agent (CLI mode)  |  type quit or exit to leave")
+    mode_hint = "one-shot (--prompt)" if first_prompt else "interactive (type quit or exit to leave)"
+    print(f"VASP Agent (CLI mode, {mode_hint})")
     print(f"Working directory: {workspace}")
     if resume:
         print(f"Resuming session: {resume} (structured state or log.txt)")
@@ -670,7 +841,10 @@ async def cli_main(
                 options=build_options(workspace, resume=resume, persist_context=persist_context),
             ) as client:
                 scheduler = AgentScheduler(client, store, TaskRegistry(store))
-                await cli_agent_loop(client, log_file, workspace, scheduler)
+                if first_prompt:
+                    await _run_prompt_once(client, log_file, workspace, scheduler, first_prompt)
+                else:
+                    await cli_agent_loop(client, log_file, workspace, scheduler)
         except ProcessError:
             _print_process_error_help(workspace, resume)
             if not _stderr_indicates_missing_conversation(workspace, resume):
@@ -690,7 +864,10 @@ async def cli_main(
                     options=build_options(workspace, resume=None, persist_context=fallback_context),
                 ) as client:
                     scheduler = AgentScheduler(client, store, TaskRegistry(store))
-                    await cli_agent_loop(client, log_file, workspace, scheduler)
+                    if first_prompt:
+                        await _run_prompt_once(client, log_file, workspace, scheduler, first_prompt)
+                    else:
+                        await cli_agent_loop(client, log_file, workspace, scheduler)
             except ProcessError:
                 _print_process_error_help(workspace, None)
                 raise
@@ -1605,6 +1782,16 @@ def parse_args() -> argparse.Namespace:
         help="Model name; defaults to LLM_MODEL in .env (UPSTREAM_MODEL also accepted)",
     )
     parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help=(
+            "One-shot CLI mode: send this single instruction, print the reply, then exit "
+            "(no interactive REPL; suitable for headless servers and scripts)"
+        ),
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Still use the workspace from --dir, but do not resume the session from log.txt (for invalid sessions or debugging)",
@@ -1624,6 +1811,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.mode == "web" and args.prompt:
+        print("Error: --prompt only applies to CLI mode (default). Drop --mode web or drop --prompt.", file=sys.stderr)
+        sys.exit(2)
+    resolve_claude_cli()  # locate / install Claude Code CLI once, before any session starts
     endpoint = resolve_llm_endpoint(
         api_base=args.api_base,
         api_key=args.api_key,
@@ -1651,7 +1842,13 @@ def main() -> None:
         )
     else:
         asyncio.run(
-            cli_main(workspace_str, resume, log_append, persist_context=persist_context),
+            cli_main(
+                workspace_str,
+                resume,
+                log_append,
+                persist_context=persist_context,
+                first_prompt=args.prompt,
+            ),
         )
 
 

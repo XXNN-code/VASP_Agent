@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Repository root entry point: ``python main.py`` (same usage as before)."""
+"""Repository root entry point: ``python main.py``.
+
+Default mode is the interactive terminal REPL (no GUI/web needed):
+  python main.py                 # interactive CLI chat with the agent
+  python main.py --prompt "..."  # one-shot: single instruction, print reply, exit
+  python main.py --mode web      # optional browser UI (headless machines can ignore it)
+"""
 from __future__ import annotations
 
 import sys
